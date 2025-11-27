@@ -349,6 +349,49 @@ class TestAllOptimizers(OptimizerFixtureGenerator, _QuickTester):
         assert "C" in best_params, "Best parameters should contain 'C'"
         assert "gamma" in best_params, "Best parameters should contain 'gamma'"
 
+    def test_gfo_union_grid(self, object_instance):
+        """GFO optimizers should handle sklearn-style union grids."""
+        from hyperactive.opt._adapters._gfo import _BaseGFOadapter
+
+        if not isinstance(object_instance, _BaseGFOadapter):
+            return None
+
+        from sklearn.datasets import load_iris
+        from sklearn.svm import SVC
+
+        from hyperactive.experiment.integrations import SklearnCvExperiment
+
+        X, y = load_iris(return_X_y=True)
+        sklearn_exp = SklearnCvExperiment(estimator=SVC(), X=X, y=y)
+
+        # sklearn-style union grid: different params for different kernels
+        search_space = [
+            {"kernel": ["linear"], "C": [0.1, 1.0, 10.0]},
+            {"kernel": ["rbf"], "C": [0.1, 1.0], "gamma": [0.01, 0.1]},
+        ]
+        _config = {
+            "search_space": search_space,
+            "n_iter": 5,
+            "experiment": sklearn_exp,
+        }
+        optimizer = object_instance.clone().set_params(**_config)
+        optimizer.solve()
+        best_params = optimizer.best_params_
+
+        assert isinstance(best_params, dict)
+        assert "kernel" in best_params
+        assert "C" in best_params
+        assert best_params["kernel"] in {"linear", "rbf"}
+
+        # If kernel is rbf, gamma should be present
+        if best_params["kernel"] == "rbf":
+            assert "gamma" in best_params
+            assert best_params["gamma"] in {0.01, 0.1}
+
+        # Verify union grid configs were stored
+        assert optimizer._union_grid_configs is not None
+        assert len(optimizer._union_grid_configs) == 7  # 3 + 4 configs
+
     def test_selection_direction_backend(self, object_instance):
         """Backends return argmax over standardized scores on controlled setup.
 

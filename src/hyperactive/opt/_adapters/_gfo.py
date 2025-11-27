@@ -28,6 +28,8 @@ class _BaseGFOadapter(BaseOptimizer):
     def __init__(self):
         super().__init__()
 
+        self._union_grid_configs = None
+
         if self.initialize is None:
             self._initialize = {"grid": 4, "random": 2, "vertices": 4}
         else:
@@ -87,13 +89,18 @@ class _BaseGFOadapter(BaseOptimizer):
     def _to_dict_np(self, search_space):
         """Coerce the search space to a format suitable for gfo optimizers.
 
-        gfo expects dicts of numpy arrays, not lists.
-        This method coerces lists or tuples in the search space to numpy arrays.
+        gfo expects dicts of numpy arrays, not lists. This method coerces
+        lists or tuples in the search space to numpy arrays.
+
+        This method also supports sklearn-style union grids (list of dicts),
+        which are flattened into a single indexed search space.
 
         Parameters
         ----------
-        search_space : dict with str keys and iterable values
-            The search space to coerce.
+        search_space : dict or list of dict
+            The search space to coerce. Can be:
+            - dict with str keys and array-like values (standard grid)
+            - list of dicts (sklearn-style union grid)
 
         Returns
         -------
@@ -102,14 +109,81 @@ class _BaseGFOadapter(BaseOptimizer):
         """
         import numpy as np
 
+        # Handle sklearn-style union grids (list of dicts)
+        if isinstance(search_space, list):
+            return self._handle_union_grid(search_space)
+
         def coerce_to_numpy(arr):
             """Coerce a list or tuple to a numpy array."""
             if not isinstance(arr, np.ndarray):
                 return np.array(arr)
             return arr
 
+        self._union_grid_configs = None  # Not a union grid
         coerced_search_space = {k: coerce_to_numpy(v) for k, v in search_space.items()}
         return coerced_search_space
+
+    def _handle_union_grid(self, search_space):
+        """Handle sklearn-style union grids (list of dicts).
+
+        Union grids allow specifying different parameter combinations for
+        different sub-grids. For example::
+
+            [
+                {'kernel': ['linear'], 'C': [0.1, 1, 10]},
+                {'kernel': ['rbf'], 'C': [0.1, 1], 'gamma': [0.01, 0.1]},
+            ]
+
+        This is converted to an indexed search space where each index
+        corresponds to a specific configuration from the union grid.
+
+        Parameters
+        ----------
+        search_space : list of dict
+            sklearn-style union grid.
+
+        Returns
+        -------
+        dict
+            Search space with a single ``_config_idx`` dimension containing
+            indices into the flattened configuration list.
+        """
+        import numpy as np
+        from sklearn.model_selection import ParameterGrid
+
+        # Generate all configurations from the union grid
+        all_configs = list(ParameterGrid(search_space))
+
+        if not all_configs:
+            raise ValueError("Union grid resulted in empty configuration set.")
+
+        # Store configurations for decoding
+        self._union_grid_configs = all_configs
+
+        # Create a simple indexed search space
+        # GFO will search over config indices
+        return {"_config_idx": np.arange(len(all_configs))}
+
+    def _decode_union_grid(self, params):
+        """Decode union grid index back to actual parameters.
+
+        Parameters
+        ----------
+        params : dict
+            Parameter dict containing ``_config_idx``.
+
+        Returns
+        -------
+        dict
+            Actual parameter configuration from the union grid.
+        """
+        if self._union_grid_configs is None:
+            return params
+
+        config_idx = int(params.get("_config_idx", 0))
+        if 0 <= config_idx < len(self._union_grid_configs):
+            return self._union_grid_configs[config_idx].copy()
+        return params
 
     def _solve(self, experiment, **search_config):
         """Run the optimization search process.
@@ -133,13 +207,21 @@ class _BaseGFOadapter(BaseOptimizer):
         gfo_cls = self._get_gfo_class()
         gfopt = gfo_cls(**search_config)
 
+        # Wrap objective to handle union grid decoding
+        def _objective(params):
+            decoded_params = self._decode_union_grid(params)
+            score, _ = experiment.score(decoded_params)
+            return score
+
         with StdoutMute(active=not self.verbose):
             gfopt.search(
-                objective_function=experiment.score,
+                objective_function=_objective,
                 n_iter=n_iter,
                 max_time=max_time,
             )
+
         best_params = gfopt.best_para
+        best_params = self._decode_union_grid(best_params)
         return best_params
 
     @classmethod
